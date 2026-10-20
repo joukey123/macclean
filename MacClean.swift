@@ -311,8 +311,11 @@ enum Updater {
                     cont.resume()
                 } else {
                     let text = String(data: data, encoding: .utf8) ?? ""
-                    let tail = text.split(separator: "\n").suffix(6).joined(separator: "\n")
-                    cont.resume(throwing: EngineError.failed("업데이트 중 문제가 생겼어요:\n\(tail)"))
+                    let lines = text.split(separator: "\n").map(String.init)
+                    // 컴파일 에러면 'error:' 줄을 먼저 보여줌 (원인이 잘려 보이지 않도록)
+                    let errors = lines.filter { $0.contains("error:") }
+                    let shown = errors.isEmpty ? Array(lines.suffix(6)) : Array(errors.prefix(4))
+                    cont.resume(throwing: EngineError.failed("업데이트 중 문제가 생겼어요:\n" + shown.joined(separator: "\n")))
                 }
             }
         }
@@ -418,10 +421,10 @@ enum SysProbe {
         }
         if r == KERN_SUCCESS {
             let page = UInt64(getpagesize())
-            let internal = UInt64(stats.internal_page_count)
+            let anonPages = UInt64(stats.internal_page_count)
             let purgeable = UInt64(stats.purgeable_count)
             // 활성 상태 보기(Activity Monitor)와 같은 계산
-            m.app = (internal > purgeable ? internal - purgeable : 0) * page
+            m.app = (anonPages > purgeable ? anonPages - purgeable : 0) * page
             m.wired = UInt64(stats.wire_count) * page
             m.compressed = UInt64(stats.compressor_page_count) * page
             m.cached = (UInt64(stats.external_page_count) + purgeable) * page
@@ -612,7 +615,7 @@ final class Model: ObservableObject {
     func purgeFileCache() async {
         let before = mem.cached
         var err: NSDictionary?
-        NSAppleScript(source: "do shell script \"/usr/sbin/purge\" with administrator privileges")?
+        _ = NSAppleScript(source: "do shell script \"/usr/sbin/purge\" with administrator privileges")?
             .executeAndReturnError(&err)
         if let err {
             if (err[NSAppleScript.errorNumber] as? Int) == -128 { return }   // 사용자가 취소
