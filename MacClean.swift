@@ -3,6 +3,7 @@
 
 import SwiftUI
 import AppKit
+import IOKit.ps
 
 // MARK: - 데이터
 
@@ -345,10 +346,285 @@ enum Updater {
     """
 }
 
+// MARK: - 내 맥 (사양·메모리·저장공간)
+
+struct HardwareInfo {
+    var name: String?          // MacBook Pro
+    var chip: String?          // Apple M3 Pro
+    var memoryText: String?    // 18 GB
+    var macOS = ""
+    var cores = 0
+    var perfCores: Int?
+    var effCores: Int?
+    var bootDate: Date?
+    var cycles: Int?
+    var condition: String?
+    var maxCapacity: String?
+}
+
+struct MemInfo {
+    var total: UInt64 = 0
+    var app: UInt64 = 0
+    var wired: UInt64 = 0
+    var compressed: UInt64 = 0
+    var cached: UInt64 = 0
+    var swapUsed: UInt64 = 0
+    var pressure = 1            // 1 정상, 2 주의, 4 높음
+    var used: UInt64 { app + wired + compressed }
+}
+
+struct DiskInfo {
+    var total: Int64 = 0
+    var free: Int64 = 0         // 시스템이 확보할 수 있는 공간 포함
+    var purgeable: Int64 = 0
+}
+
+struct BatteryInfo {
+    var percent: Int
+    var charging: Bool
+    var onAC: Bool
+}
+
+struct AppMem: Identifiable {
+    let pid: pid_t
+    let name: String
+    let path: String
+    let bytes: UInt64
+    var id: pid_t { pid }
+}
+
+func fmtMem(_ b: UInt64) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .memory)
+}
+
+enum SysProbe {
+    static let host = mach_host_self()
+
+    static func sysctlInt(_ name: String) -> Int? {
+        var v: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname(name, &v, &size, nil, 0) == 0 ? Int(v) : nil
+    }
+
+    static func memory() -> MemInfo {
+        var m = MemInfo()
+        m.total = ProcessInfo.processInfo.physicalMemory
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let r = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
+            }
+        }
+        if r == KERN_SUCCESS {
+            let page = UInt64(getpagesize())
+            let internal = UInt64(stats.internal_page_count)
+            let purgeable = UInt64(stats.purgeable_count)
+            // 활성 상태 보기(Activity Monitor)와 같은 계산
+            m.app = (internal > purgeable ? internal - purgeable : 0) * page
+            m.wired = UInt64(stats.wire_count) * page
+            m.compressed = UInt64(stats.compressor_page_count) * page
+            m.cached = (UInt64(stats.external_page_count) + purgeable) * page
+        }
+        var swap = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        if sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0 { m.swapUsed = swap.xsu_used }
+        if let level = sysctlInt("kern.memorystatus_vm_pressure_level") { m.pressure = level }
+        return m
+    }
+
+    static func cpuTicks() -> [UInt64]? {   // user, system, idle, nice
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let r = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard r == KERN_SUCCESS else { return nil }
+        let t = info.cpu_ticks
+        return [UInt64(t.0), UInt64(t.1), UInt64(t.2), UInt64(t.3)]
+    }
+
+    static func disk() -> DiskInfo {
+        let url = URL(fileURLWithPath: NSHomeDirectory())
+        let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityKey,
+                                         .volumeAvailableCapacityForImportantUsageKey]
+        guard let v = try? url.resourceValues(forKeys: keys) else { return DiskInfo() }
+        let total = Int64(v.volumeTotalCapacity ?? 0)
+        let avail = Int64(v.volumeAvailableCapacity ?? 0)
+        let important = v.volumeAvailableCapacityForImportantUsage ?? avail
+        return DiskInfo(total: total, free: max(important, avail), purgeable: max(0, important - avail))
+    }
+
+    static func battery() -> BatteryInfo? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for ps in list {
+            guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any] else { continue }
+            guard (d[kIOPSTypeKey] as? String) == kIOPSInternalBatteryType else { continue }
+            let cur = d[kIOPSCurrentCapacityKey] as? Int ?? 0
+            let maxCap = d[kIOPSMaxCapacityKey] as? Int ?? 100
+            return BatteryInfo(percent: maxCap > 0 ? cur * 100 / maxCap : cur,
+                               charging: d[kIOPSIsChargingKey] as? Bool ?? false,
+                               onAC: (d[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue)
+        }
+        return nil
+    }
+
+    static func bootDate() -> Date? {
+        var tv = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(tv.tv_sec))
+    }
+
+    /// 칩, 모델명, 배터리 수명 등 (system_profiler, 1~2초)
+    static func hardware() -> HardwareInfo {
+        var h = HardwareInfo()
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        h.macOS = "macOS \(v.majorVersion).\(v.minorVersion)" + (v.patchVersion > 0 ? ".\(v.patchVersion)" : "")
+        h.cores = ProcessInfo.processInfo.processorCount
+        h.perfCores = sysctlInt("hw.perflevel0.physicalcpu")
+        h.effCores = sysctlInt("hw.perflevel1.physicalcpu")
+        h.bootDate = bootDate()
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        p.arguments = ["SPHardwareDataType", "SPPowerDataType", "-json"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return h }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return h }
+
+        if let hw = (root["SPHardwareDataType"] as? [[String: Any]])?.first {
+            h.name = hw["machine_name"] as? String
+            h.chip = (hw["chip_type"] as? String) ?? (hw["cpu_type"] as? String)
+            h.memoryText = hw["physical_memory"] as? String
+        }
+        for d in (root["SPPowerDataType"] as? [[String: Any]]) ?? [] {
+            guard let health = d["sppower_battery_health_info"] as? [String: Any] else { continue }
+            h.cycles = health["sppower_battery_cycle_count"] as? Int
+            if let c = health["sppower_battery_health"] as? String {
+                switch c.lowercased() {
+                case "good", "normal": h.condition = "정상"
+                case "fair": h.condition = "보통"
+                default: h.condition = "점검 권장"
+                }
+            }
+            h.maxCapacity = health["sppower_battery_health_maximum_capacity"] as? String
+        }
+        return h
+    }
+
+    /// 내 계정 프로세스들의 (실행 파일 경로, 메모리 KB)
+    static func processRows() -> [(path: String, kb: UInt64)] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-x", "-o", "rss=,comm="]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        var rows: [(path: String, kb: UInt64)] = []
+        for line in text.split(separator: "\n") {
+            let parts = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard parts.count == 2, let kb = UInt64(parts[0]) else { continue }
+            rows.append((path: parts[1].trimmingCharacters(in: .whitespaces), kb: kb))
+        }
+        return rows
+    }
+}
+
 // MARK: - 상태
 
 @MainActor
 final class Model: ObservableObject {
+    // 내 맥
+    @Published var hw: HardwareInfo?
+    @Published var mem = MemInfo()
+    @Published var cpu: Double = 0
+    @Published var disk = DiskInfo()
+    @Published var battery: BatteryInfo?
+    @Published var heavyApps: [AppMem] = []
+    private var lastTicks: [UInt64]?
+
+    func loadHardware() async {
+        if hw != nil { return }
+        hw = await Task.detached(priority: .utility) { SysProbe.hardware() }.value
+    }
+
+    func refreshLive(includeApps: Bool) async {
+        mem = SysProbe.memory()
+        disk = SysProbe.disk()
+        battery = SysProbe.battery()
+        if let t = SysProbe.cpuTicks() {
+            if let prev = lastTicks, prev.count == t.count {
+                let d = zip(t, prev).map { $0 &- $1 }
+                let busy = Double(d[0] + d[1] + d[3])
+                let all = busy + Double(d[2])
+                if all > 0 { cpu = busy / all }
+            }
+            lastTicks = t
+        }
+        if includeApps { await refreshHeavyApps() }
+    }
+
+    func refreshHeavyApps() async {
+        let rows = await Task.detached(priority: .utility) { SysProbe.processRows() }.value
+        let me = Bundle.main.bundleIdentifier
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.bundleIdentifier != me && $0.bundleIdentifier != "com.apple.finder"
+        }
+        // 앱 본체 + 도우미 프로세스(크롬 렌더러 등)를 앱 단위로 합산
+        let prefixes: [(pid: pid_t, prefix: String)] = apps.compactMap { a in
+            guard let u = a.bundleURL else { return nil }
+            return (pid: a.processIdentifier, prefix: u.path + "/")
+        }
+        var totals: [pid_t: UInt64] = [:]
+        for r in rows {
+            if let hit = prefixes.first(where: { r.path.hasPrefix($0.prefix) }) {
+                totals[hit.pid, default: 0] += r.kb * 1024
+            }
+        }
+        let list: [AppMem] = apps.compactMap { a in
+            guard let b = totals[a.processIdentifier], b > 0 else { return nil }
+            return AppMem(pid: a.processIdentifier, name: a.localizedName ?? "앱", path: a.bundleURL?.path ?? "", bytes: b)
+        }
+        heavyApps = Array(list.sorted { $0.bytes > $1.bytes }.prefix(8))
+    }
+
+    func quitApp(_ app: AppMem) {
+        NSRunningApplication(processIdentifier: app.pid)?.terminate()
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await refreshLive(includeApps: true)
+        }
+    }
+
+    /// macOS의 purge: 파일 캐시를 비움 (관리자 암호 필요, 효과는 일시적)
+    func purgeFileCache() async {
+        let before = mem.cached
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"/usr/sbin/purge\" with administrator privileges")?
+            .executeAndReturnError(&err)
+        if let err {
+            if (err[NSAppleScript.errorNumber] as? Int) == -128 { return }   // 사용자가 취소
+            error = "파일 캐시를 비우지 못했어요."
+            return
+        }
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        await refreshLive(includeApps: false)
+        let freed = before > mem.cached ? before - mem.cached : 0
+        banner = "파일 캐시 \(fmtMem(freed))를 비웠어요. 맥이 필요할 때 다시 채워요."
+    }
+
     // 업데이트
     @Published var currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
     @Published var latestVersion: String?
@@ -717,12 +993,13 @@ final class Model: ObservableObject {
 
 // MARK: - 디자인 요소
 
-enum Pane: Hashable, CaseIterable { case scan, privacy, apps, trash }
+enum Pane: Hashable, CaseIterable { case scan, system, privacy, apps, trash }
 
 extension Pane {
     var gradient: [Color] {
         switch self {
         case .scan: return [Color(hex: 0x1E1B4B), Color(hex: 0x5B2A86), Color(hex: 0xA2346F)]
+        case .system: return [Color(hex: 0x0C0A2A), Color(hex: 0x312E81), Color(hex: 0x0E7490)]
         case .privacy: return [Color(hex: 0x0B132B), Color(hex: 0x1C2E73), Color(hex: 0x2F5BD3)]
         case .apps: return [Color(hex: 0x082F49), Color(hex: 0x0E5E6F), Color(hex: 0x1C8C7A)]
         case .trash: return [Color(hex: 0x16181F), Color(hex: 0x2E3247), Color(hex: 0x4A4366)]
@@ -918,6 +1195,7 @@ struct ContentView: View {
                     Group {
                         switch pane {
                         case .scan: ScanView()
+                        case .system: SystemView { pane = .scan }
                         case .privacy: PrivacyView()
                         case .apps: AppsView()
                         case .trash: TrashView()
@@ -931,6 +1209,7 @@ struct ContentView: View {
         .foregroundStyle(Color.white)
         .preferredColorScheme(.dark)
         .task {
+            await m.refreshLive(includeApps: false)
             await m.checkForUpdate()
             await m.loadTrash()
         }
@@ -961,6 +1240,13 @@ struct Sidebar: View {
                         icon: "sparkles",
                         colors: [Color(hex: 0xF0ABFC), Color(hex: 0xA855F7)],
                         selected: pane == .scan) { pane = .scan }
+            SidebarItem(title: "내 맥",
+                        subtitle: m.mem.total > 0
+                            ? "메모리 \(Int(Double(m.mem.used) / Double(m.mem.total) * 100))% · 남은 공간 \(fmt(m.disk.free))"
+                            : "사양 · 메모리 · 저장 공간",
+                        icon: "laptopcomputer",
+                        colors: [Color(hex: 0x67E8F9), Color(hex: 0x6366F1)],
+                        selected: pane == .system) { pane = .system }
             SidebarItem(title: "개인정보",
                         subtitle: m.privSelected.isEmpty ? "방문 기록 · 쿠키" : "\(m.privSelected.count)개 선택",
                         icon: "hand.raised.fill",
@@ -1457,6 +1743,369 @@ struct ItemRow: View {
             .fill(Color.white.opacity(hover ? 0.12 : 0.07)))
         .contentShape(Rectangle())
         .onTapGesture(perform: toggle)
+        .onHover { hover = $0 }
+    }
+}
+
+// MARK: - 내 맥
+
+struct RingGauge: View {
+    let value: Double
+    let colors: [Color]
+    let label: String
+    let sub: String
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.white.opacity(0.1), lineWidth: 11)
+            Circle()
+                .trim(from: 0, to: CGFloat(min(max(value, 0.001), 1)))
+                .stroke(LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing),
+                        style: StrokeStyle(lineWidth: 11, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.6), value: value)
+            VStack(spacing: 0) {
+                Text(label).font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+                Text(sub).font(.system(size: 10)).foregroundStyle(Color.white.opacity(0.55))
+            }
+        }
+        .frame(width: 108, height: 108)
+    }
+}
+
+struct StatLine: View {
+    let title: String
+    let value: String
+    var accent: Color? = nil
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title).font(.system(size: 12)).foregroundStyle(Color.white.opacity(0.6))
+            Spacer(minLength: 6)
+            Text(value).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                .foregroundStyle(accent ?? Color.white)
+        }
+    }
+}
+
+struct MemoryPart: Identifiable {
+    let name: String
+    let bytes: UInt64
+    let color: Color
+    var id: String { name }
+}
+
+struct StackBar: View {
+    let parts: [MemoryPart]
+    let total: UInt64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            GeometryReader { g in
+                HStack(spacing: 0) {
+                    ForEach(parts) { p in
+                        Rectangle()
+                            .fill(p.color)
+                            .frame(width: g.size.width * CGFloat(Double(p.bytes) / Double(max(total, 1))))
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .frame(height: 10)
+            .background(Color.white.opacity(0.08))
+            .clipShape(Capsule())
+            .animation(.easeInOut(duration: 0.6), value: parts.map(\.bytes))
+
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 6) {
+                ForEach(parts) { p in
+                    HStack(spacing: 6) {
+                        Circle().fill(p.color).frame(width: 8, height: 8)
+                        Text(p.name).font(.system(size: 11)).foregroundStyle(Color.white.opacity(0.65))
+                        Spacer(minLength: 4)
+                        Text(fmtMem(p.bytes)).font(.system(size: 11, weight: .semibold, design: .rounded)).monospacedDigit()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct SystemView: View {
+    @EnvironmentObject var m: Model
+    let goScan: () -> Void
+    @State private var confirmPurge = false
+
+    var uptime: String {
+        guard let boot = m.hw?.bootDate else { return "" }
+        let f = DateComponentsFormatter()
+        var cal = Calendar(identifier: .gregorian)
+        cal.locale = Locale(identifier: "ko_KR")
+        f.calendar = cal
+        f.allowedUnits = [.day, .hour, .minute]
+        f.unitsStyle = .full
+        f.maximumUnitCount = 2
+        return f.string(from: boot, to: Date()) ?? ""
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)],
+                          alignment: .leading, spacing: 14) {
+                    storageCard
+                    memoryCard
+                    cpuCard
+                    if m.battery != nil { batteryCard }
+                }
+                appsCard
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 18)
+            .padding(.bottom, 24)
+        }
+        .task { await m.loadHardware() }
+        .task {
+            var n = 0
+            while !Task.isCancelled {
+                await m.refreshLive(includeApps: n % 3 == 0)
+                n += 1
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        .alert("파일 캐시를 비울까요?", isPresented: $confirmPurge) {
+            Button("비우기") { Task { await m.purgeFileCache() } }
+            Button("취소", role: .cancel) {}
+        } message: {
+            Text("관리자 암호를 물어봐요.\n맥은 남는 메모리를 파일 캐시로 써서 앱을 빨리 열어요. 비우면 메모리 숫자가 잠깐 줄지만 금방 다시 채워지고, 직후엔 앱이 조금 느리게 열릴 수 있어요.")
+        }
+    }
+
+    var header: some View {
+        HStack(spacing: 16) {
+            Image(nsImage: NSImage(named: NSImage.computerName) ?? NSImage())
+                .resizable()
+                .frame(width: 64, height: 64)
+                .shadow(color: Color.black.opacity(0.3), radius: 10, y: 5)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(m.hw?.name ?? "내 Mac").font(.system(size: 30, weight: .bold, design: .rounded))
+                Text([m.hw?.chip, m.hw?.memoryText.map { "메모리 \($0)" }].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.8))
+                Text([m.hw?.macOS ?? "", uptime.isEmpty ? "" : "켜진 지 \(uptime)"].filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.white.opacity(0.55))
+            }
+            Spacer()
+        }
+    }
+
+    func title(_ t: String, _ icon: String, _ colors: [Color]) -> some View {
+        HStack(spacing: 8) {
+            IconTile(icon: icon, colors: colors, size: 26)
+            Text(t).font(.system(size: 14, weight: .semibold))
+        }
+    }
+
+    func percent(_ part: Double, _ whole: Double) -> Int {
+        whole > 0 ? Int((part / whole * 100).rounded()) : 0
+    }
+
+    var storageCard: some View {
+        let used = max(0, m.disk.total - m.disk.free)
+        let frac = m.disk.total > 0 ? Double(used) / Double(m.disk.total) : 0
+        return Card {
+            VStack(alignment: .leading, spacing: 14) {
+                title("저장 공간", "internaldrive.fill", [Color(hex: 0x7DD3FC), Color(hex: 0x2563EB)])
+                HStack(spacing: 18) {
+                    RingGauge(value: frac,
+                              colors: frac > 0.9 ? [Color(hex: 0xFCA5A5), Color(hex: 0xDC2626)] : [Color(hex: 0x7DD3FC), Color(hex: 0x6366F1)],
+                              label: "\(percent(Double(used), Double(m.disk.total)))%", sub: "사용 중")
+                    VStack(alignment: .leading, spacing: 7) {
+                        StatLine(title: "전체", value: fmt(m.disk.total))
+                        StatLine(title: "사용", value: fmt(used))
+                        StatLine(title: "남은 공간", value: fmt(m.disk.free), accent: Color(hex: 0x6EE7B7))
+                        if m.disk.purgeable > 0 {
+                            StatLine(title: "macOS가 확보 가능", value: fmt(m.disk.purgeable))
+                        }
+                    }
+                }
+                Button(action: goScan) {
+                    Label("스마트 스캔으로 공간 확보", systemImage: "sparkles")
+                }
+                .buttonStyle(GhostButton())
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    var pressureBadge: some View {
+        let (text, color): (String, Color) = {
+            switch m.mem.pressure {
+            case 4: return ("메모리 부족", Color(hex: 0xF87171))
+            case 2: return ("조금 빠듯해요", Color(hex: 0xFCD34D))
+            default: return ("여유 있어요", Color(hex: 0x6EE7B7))
+            }
+        }()
+        return Text(text)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.18), in: Capsule())
+    }
+
+    var memoryCard: some View {
+        let frac = m.mem.total > 0 ? Double(m.mem.used) / Double(m.mem.total) : 0
+        return Card {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    title("메모리 (램)", "memorychip.fill", [Color(hex: 0xF0ABFC), Color(hex: 0xA855F7)])
+                    Spacer()
+                    pressureBadge
+                }
+                HStack(spacing: 18) {
+                    RingGauge(value: frac, colors: [Color(hex: 0xF0ABFC), Color(hex: 0x8B5CF6)],
+                              label: "\(percent(Double(m.mem.used), Double(m.mem.total)))%", sub: "사용 중")
+                    VStack(alignment: .leading, spacing: 7) {
+                        StatLine(title: "전체", value: fmtMem(m.mem.total))
+                        StatLine(title: "사용", value: fmtMem(m.mem.used))
+                        StatLine(title: "스왑 (디스크 사용)", value: fmtMem(m.mem.swapUsed),
+                                 accent: m.mem.swapUsed > 2 << 30 ? Color(hex: 0xFCD34D) : nil)
+                    }
+                }
+                StackBar(parts: [
+                    MemoryPart(name: "앱 메모리", bytes: m.mem.app, color: Color(hex: 0xC084FC)),
+                    MemoryPart(name: "고정 메모리", bytes: m.mem.wired, color: Color(hex: 0xF472B6)),
+                    MemoryPart(name: "압축됨", bytes: m.mem.compressed, color: Color(hex: 0xFBBF24)),
+                    MemoryPart(name: "캐시된 파일", bytes: m.mem.cached, color: Color(hex: 0x94A3B8)),
+                ], total: m.mem.total)
+                Text("캐시된 파일은 다른 앱이 필요하면 바로 비워져요. 상태가 '여유 있어요'면 정리할 필요 없어요.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.white.opacity(0.5))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    var cpuCard: some View {
+        let coresText: String = {
+            guard let hw = m.hw else { return "" }
+            if let p = hw.perfCores, let e = hw.effCores { return "\(hw.cores)코어 (성능 \(p) · 효율 \(e))" }
+            return "\(hw.cores)코어"
+        }()
+        return Card {
+            VStack(alignment: .leading, spacing: 14) {
+                title("프로세서 (CPU)", "cpu.fill", [Color(hex: 0x86EFAC), Color(hex: 0x059669)])
+                HStack(spacing: 18) {
+                    RingGauge(value: m.cpu, colors: [Color(hex: 0x86EFAC), Color(hex: 0x14B8A6)],
+                              label: "\(Int((m.cpu * 100).rounded()))%", sub: "사용 중")
+                    VStack(alignment: .leading, spacing: 7) {
+                        StatLine(title: "칩", value: m.hw?.chip ?? "—")
+                        StatLine(title: "코어", value: coresText.isEmpty ? "—" : coresText)
+                    }
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    var batteryCard: some View {
+        let b = m.battery ?? BatteryInfo(percent: 0, charging: false, onAC: false)
+        let state = b.charging ? "충전 중" : (b.onAC ? "전원 연결됨" : "배터리 사용 중")
+        return Card {
+            VStack(alignment: .leading, spacing: 14) {
+                title("배터리", b.charging ? "battery.100.bolt" : "battery.75", [Color(hex: 0xFDE047), Color(hex: 0xF59E0B)])
+                HStack(spacing: 18) {
+                    RingGauge(value: Double(b.percent) / 100,
+                              colors: b.percent <= 20 ? [Color(hex: 0xFCA5A5), Color(hex: 0xDC2626)] : [Color(hex: 0xFDE047), Color(hex: 0x84CC16)],
+                              label: "\(b.percent)%", sub: state)
+                    VStack(alignment: .leading, spacing: 7) {
+                        StatLine(title: "배터리 상태", value: m.hw?.condition ?? "—",
+                                 accent: m.hw?.condition == "점검 권장" ? Color(hex: 0xFCD34D) : nil)
+                        StatLine(title: "최대 용량", value: m.hw?.maxCapacity ?? "—")
+                        StatLine(title: "충전 횟수", value: m.hw?.cycles.map { "\($0)회" } ?? "—")
+                    }
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    var appsCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    title("메모리를 많이 쓰는 앱", "square.stack.3d.down.right.fill", [Color(hex: 0xFDA4AF), Color(hex: 0xE11D48)])
+                    Spacer()
+                    Button {
+                        confirmPurge = true
+                    } label: {
+                        Label("파일 캐시 비우기", systemImage: "wind")
+                    }
+                    .buttonStyle(GhostButton())
+                    .disabled(m.working)
+                }
+                Text("안 쓰는 앱을 종료하는 게 램을 확보하는 가장 확실한 방법이에요. 종료하기 전에 저장할 내용이 있는지 확인해주세요.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.white.opacity(0.55))
+                    .fixedSize(horizontal: false, vertical: true)
+                if m.heavyApps.isEmpty {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text("앱 메모리 확인 중…").font(.system(size: 12)).foregroundStyle(Color.white.opacity(0.6))
+                    }
+                    .padding(.vertical, 8)
+                } else {
+                    VStack(spacing: 6) {
+                        ForEach(m.heavyApps) { app in
+                            HeavyAppRow(app: app, total: m.mem.total)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+struct HeavyAppRow: View {
+    @EnvironmentObject var m: Model
+    let app: AppMem
+    let total: UInt64
+    @State private var hover = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                .resizable()
+                .frame(width: 28, height: 28)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(app.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                GeometryReader { g in
+                    Capsule()
+                        .fill(LinearGradient(colors: [Color(hex: 0xFDA4AF), Color(hex: 0xE11D48)], startPoint: .leading, endPoint: .trailing))
+                        .frame(width: max(4, g.size.width * CGFloat(Double(app.bytes) / Double(max(total, 1)))))
+                }
+                .frame(height: 4)
+            }
+            Text(fmtMem(app.bytes))
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .frame(width: 80, alignment: .trailing)
+            Button("종료") { m.quitApp(app) }
+                .buttonStyle(GhostButton())
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Color.white.opacity(hover ? 0.1 : 0.05)))
         .onHover { hover = $0 }
     }
 }
