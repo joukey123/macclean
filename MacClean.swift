@@ -1185,8 +1185,32 @@ struct Card<Content: View>: View {
 
 // MARK: - 앱
 
+/// 메뉴 막대에 떠 있는 동안은 창을 닫아도 앱을 끄지 않음 (상주 프로그램)
+enum Residency {
+    static var menuBarOn: Bool { UserDefaults.standard.object(forKey: "menuBarEnabled") as? Bool ?? true }
+
+    /// 창이 열리면 Dock에 아이콘 표시
+    static func showInDock() {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+    }
+
+    /// 창을 닫으면 Dock 아이콘을 숨기고 메뉴 막대에만 남음
+    static func hideFromDockIfResident() {
+        guard menuBarOn else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // 메뉴 막대 표시를 꺼둔 상태면 숨은 채로 남지 않도록 종료
+        !Residency.menuBarOn
+    }
+}
+
 @main
 struct MacCleanApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = Model()
     @AppStorage("menuBarEnabled") private var menuBarEnabled = true
 
@@ -1243,6 +1267,8 @@ struct ContentView: View {
         }
         .foregroundStyle(Color.white)
         .preferredColorScheme(.dark)
+        .onAppear { Residency.showInDock() }
+        .onDisappear { Residency.hideFromDockIfResident() }
         .task {
             await m.refreshLive(includeApps: false)
             await m.checkForUpdate()
@@ -2307,6 +2333,7 @@ struct MenuBarPanel: View {
 
     func show(_ pane: Pane) {
         m.pane = pane
+        Residency.showInDock()
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -2388,7 +2415,11 @@ struct MenuBarPanel: View {
             }
 
             HStack {
-                Button("메뉴 막대에서 숨기기") { menuBarEnabled = false }
+                Button("메뉴 막대에서 숨기기") {
+                    // 창이 닫혀 있으면 앱이 안 보이게 되므로 창을 열어둠
+                    show(.system)
+                    menuBarEnabled = false
+                }
                 Spacer()
                 Button("MacClean 종료") { NSApp.terminate(nil) }
             }
