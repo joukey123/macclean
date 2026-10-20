@@ -21,11 +21,16 @@
 필요한 것: macOS 13(Ventura) 이상, Apple 명령어 도구(무료, 처음 한 번 자동 안내)
 
 1. 이 페이지의 초록색 **Code** 버튼 → **Download ZIP**
-2. 터미널에서:
+2. 터미널에서: 
    ```bash
    cd ~/Downloads && unzip -o macclean-main.zip && bash macclean-main/build.sh
    ```
-3. "명령어 도구 설치" 창이 뜨면 설치하고, 끝나면 2번을 한 번 더 실행해요.
+   or 압축해제된 상태
+   ```bash
+   cd ~/Downloads && bash macclean-main/build.sh
+   ```
+   
+4. "명령어 도구 설치" 창이 뜨면 설치하고, 끝나면 2번을 한 번 더 실행해요.
 
 설치가 끝나면 `/Applications/MacClean.app`이 열려요. 그다음부터는 앱 안의 **업데이트** 버튼으로 새 버전을 받으면 돼요.
 
