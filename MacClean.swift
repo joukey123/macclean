@@ -43,6 +43,36 @@ struct AppInfo: Codable {
 
 enum TrashSortKey: String, CaseIterable { case date, size, name }
 
+/// 휴지통 '날짜로 선택': 이 기간보다 오래전에 삭제한 항목
+enum TrashAge: String, CaseIterable, Identifiable {
+    case day, week, month, month3, month6, year
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .day: return "하루"
+        case .week: return "일주일"
+        case .month: return "1개월"
+        case .month3: return "3개월"
+        case .month6: return "6개월"
+        case .year: return "1년"
+        }
+    }
+
+    var cutoff: Date {
+        let cal = Calendar.current
+        let now = Date()
+        switch self {
+        case .day: return cal.date(byAdding: .day, value: -1, to: now) ?? now
+        case .week: return cal.date(byAdding: .day, value: -7, to: now) ?? now
+        case .month: return cal.date(byAdding: .month, value: -1, to: now) ?? now
+        case .month3: return cal.date(byAdding: .month, value: -3, to: now) ?? now
+        case .month6: return cal.date(byAdding: .month, value: -6, to: now) ?? now
+        case .year: return cal.date(byAdding: .year, value: -1, to: now) ?? now
+        }
+    }
+}
+
 struct PrivItem: Codable, Hashable {
     let key: String
     let label: String
@@ -853,6 +883,19 @@ final class Model: ObservableObject {
     }
     var totalSize: Int64 { items.reduce(0) { $0 + $1.size } }
     var selectedSize: Int64 { items.filter { selected.contains($0.id) }.reduce(0) { $0 + $1.size } }
+    /// 그 기간보다 오래전에 삭제한 항목 (삭제 날짜를 모르는 항목은 제외)
+    func trashOlder(than age: TrashAge) -> [TrashEntry] {
+        let cutoff = age.cutoff
+        return trashItems.filter { e in
+            guard let d = e.added else { return false }
+            return d < cutoff
+        }
+    }
+
+    func selectTrash(olderThan age: TrashAge) {
+        trashSelected = Set(trashOlder(than: age).map(\.id))
+    }
+
     var trashSelectedSize: Int64 {
         trashItems.filter { trashSelected.contains($0.id) }.reduce(0) { $0 + ($1.size ?? 0) }
     }
@@ -1945,13 +1988,21 @@ struct SystemView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)],
-                          alignment: .leading, spacing: 14) {
+                // 같은 줄의 두 카드는 높이를 똑같이 (더 큰 쪽에 맞춤)
+                HStack(alignment: .top, spacing: 14) {
                     storageCard
                     memoryCard
-                    cpuCard
-                    if m.battery != nil { batteryCard }
                 }
+                .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .top, spacing: 14) {
+                    cpuCard
+                    if m.battery != nil {
+                        batteryCard
+                    } else {
+                        Color.clear.frame(maxWidth: .infinity)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
                 appsCard
             }
             .padding(.horizontal, 28)
@@ -2033,13 +2084,14 @@ struct SystemView: View {
                         }
                     }
                 }
+                Spacer(minLength: 0)   // 버튼은 카드 아래쪽에
                 Button(action: goScan) {
                     Label("스마트 스캔으로 공간 확보", systemImage: "sparkles")
                 }
                 .buttonStyle(GhostButton())
             }
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
@@ -2090,7 +2142,7 @@ struct SystemView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
@@ -2113,7 +2165,7 @@ struct SystemView: View {
                 }
             }
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
@@ -2136,7 +2188,7 @@ struct SystemView: View {
                 }
             }
             .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 
@@ -3049,6 +3101,32 @@ struct TrashView: View {
         .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
     }
 
+    /// 삭제한 지 오래된 항목을 한 번에 선택
+    var dateSelectMenu: some View {
+        Menu {
+            Section("이 기간보다 오래전에 삭제한 항목") {
+                ForEach(TrashAge.allCases) { age in
+                    let found = m.trashOlder(than: age)
+                    let size = found.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+                    Button("\(age.label) 넘게 지난 항목 · \(found.count)개 (\(fmt(size)))") {
+                        withAnimation(.easeInOut(duration: 0.15)) { m.selectTrash(olderThan: age) }
+                    }
+                    .disabled(found.isEmpty)
+                }
+            }
+        } label: {
+            Label("날짜로 선택", systemImage: "calendar")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .font(.system(size: 13, weight: .medium))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.11), in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+        .help("하루·일주일·1개월·3개월·6개월·1년보다 오래전에 삭제한 항목 선택")
+    }
+
     var sortLabel: String {
         switch (m.trashSortKey, m.trashSortAsc) {
         case (.date, false): return "최근 삭제한 순"
@@ -3067,6 +3145,7 @@ struct TrashView: View {
                 Text("완전 삭제하면 되돌릴 수 없어요").font(.system(size: 11)).foregroundStyle(Color.white.opacity(0.55))
             }
             Spacer()
+            dateSelectMenu
             Button("선택 해제") { m.trashSelected = [] }
                 .buttonStyle(GhostButton())
                 .disabled(m.trashSelected.isEmpty)
