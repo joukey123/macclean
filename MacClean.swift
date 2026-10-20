@@ -2166,8 +2166,19 @@ enum LoginItem {
     }
 }
 
+/// 메뉴 막대용 짧은 용량 표기: 561GB, 48.2GB, 1.2TB (Finder와 같은 1000 단위)
 func compactBytes(_ b: Int64) -> String {
-    ByteCountFormatter.string(fromByteCount: b, countStyle: .file).replacingOccurrences(of: " ", with: "")
+    let gb = Double(b) / 1_000_000_000
+    if gb >= 1000 { return String(format: "%.1fTB", gb / 1000) }
+    if gb >= 100 { return String(format: "%.0fGB", gb) }
+    if gb >= 1 { return String(format: "%.1fGB", gb) }
+    return String(format: "%.0fMB", Double(b) / 1_000_000)
+}
+
+struct MenuBarMetric: Identifiable {
+    let icon: String
+    let value: String
+    var id: String { icon }
 }
 
 struct MenuBarLabel: View {
@@ -2176,25 +2187,49 @@ struct MenuBarLabel: View {
     @AppStorage("mbShowRAM") private var showRAM = true
     @AppStorage("mbShowDisk") private var showDisk = true
 
-    var label: Text {
-        var t = Text("")
-        var first = true
-        func add(_ icon: String, _ value: String) {
-            if !first { t = t + Text("  ") }
-            t = t + Text(Image(systemName: icon)) + Text(" " + value)
-            first = false
+    var metrics: [MenuBarMetric] {
+        var list: [MenuBarMetric] = []
+        if showCPU { list.append(MenuBarMetric(icon: "cpu", value: "\(Int((m.cpu * 100).rounded()))%")) }
+        if showRAM, m.mem.total > 0 {
+            list.append(MenuBarMetric(icon: "memorychip", value: "\(Int(Double(m.mem.used) / Double(m.mem.total) * 100))%"))
         }
-        if showCPU { add("cpu", "\(Int((m.cpu * 100).rounded()))%") }
-        if showRAM, m.mem.total > 0 { add("memorychip", "\(Int(Double(m.mem.used) / Double(m.mem.total) * 100))%") }
-        if showDisk, m.disk.total > 0 { add("internaldrive", compactBytes(m.disk.free)) }
-        return t
+        if showDisk, m.disk.total > 0 { list.append(MenuBarMetric(icon: "internaldrive", value: compactBytes(m.disk.free))) }
+        return list
+    }
+
+    /// 메뉴 막대는 글자 사이의 아이콘을 지워버려서, 아이콘+숫자를 한 장의 그림으로 만들어 표시.
+    /// 템플릿 이미지라 밝은/어두운 메뉴 막대 색에 자동으로 맞춰짐.
+    func rendered(_ items: [MenuBarMetric]) -> NSImage? {
+        let content = HStack(spacing: 9) {
+            ForEach(items) { it in
+                HStack(spacing: 3) {
+                    Image(systemName: it.icon)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(it.value)
+                        .font(.system(size: 12, weight: .medium))
+                        .monospacedDigit()
+                }
+            }
+        }
+        .foregroundStyle(Color.black)
+        .padding(.horizontal, 1)
+        .frame(height: 18)
+
+        let renderer = ImageRenderer(content: content)
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let img = renderer.nsImage else { return nil }
+        img.isTemplate = true
+        return img
     }
 
     var body: some View {
-        if !showCPU && !showRAM && !showDisk {
+        let items = metrics
+        if items.isEmpty {
             Image(systemName: "sparkles")
+        } else if let img = rendered(items) {
+            Image(nsImage: img)
         } else {
-            label.monospacedDigit()
+            Text(items.map(\.value).joined(separator: "  "))
         }
     }
 }
