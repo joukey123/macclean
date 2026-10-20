@@ -2178,47 +2178,61 @@ func compactBytes(_ b: Int64) -> String {
 struct MenuBarMetric: Identifiable {
     let icon: String
     let value: String
+    let colors: [Color]
     var id: String { icon }
 }
 
 struct MenuBarLabel: View {
     @EnvironmentObject var m: Model
+    @Environment(\.colorScheme) private var scheme
     @AppStorage("mbShowCPU") private var showCPU = true
     @AppStorage("mbShowRAM") private var showRAM = true
     @AppStorage("mbShowDisk") private var showDisk = true
 
+    // 패널과 같은 아이콘·색
     var metrics: [MenuBarMetric] {
         var list: [MenuBarMetric] = []
-        if showCPU { list.append(MenuBarMetric(icon: "cpu", value: "\(Int((m.cpu * 100).rounded()))%")) }
-        if showRAM, m.mem.total > 0 {
-            list.append(MenuBarMetric(icon: "memorychip", value: "\(Int(Double(m.mem.used) / Double(m.mem.total) * 100))%"))
+        if showCPU {
+            list.append(MenuBarMetric(icon: "cpu.fill", value: "\(Int((m.cpu * 100).rounded()))%",
+                                      colors: [Color(hex: 0x86EFAC), Color(hex: 0x14B8A6)]))
         }
-        if showDisk, m.disk.total > 0 { list.append(MenuBarMetric(icon: "internaldrive", value: compactBytes(m.disk.free))) }
+        if showRAM, m.mem.total > 0 {
+            list.append(MenuBarMetric(icon: "memorychip.fill",
+                                      value: "\(Int(Double(m.mem.used) / Double(m.mem.total) * 100))%",
+                                      colors: [Color(hex: 0xF0ABFC), Color(hex: 0xA855F7)]))
+        }
+        if showDisk, m.disk.total > 0 {
+            let full = Double(m.disk.total - m.disk.free) / Double(m.disk.total) > 0.9
+            list.append(MenuBarMetric(icon: "internaldrive.fill", value: compactBytes(m.disk.free),
+                                      colors: full ? [Color(hex: 0xFCA5A5), Color(hex: 0xDC2626)]
+                                                   : [Color(hex: 0x7DD3FC), Color(hex: 0x6366F1)]))
+        }
         return list
     }
 
-    /// 메뉴 막대는 글자 사이의 아이콘을 지워버려서, 아이콘+숫자를 한 장의 그림으로 만들어 표시.
-    /// 템플릿 이미지라 밝은/어두운 메뉴 막대 색에 자동으로 맞춰짐.
-    func rendered(_ items: [MenuBarMetric]) -> NSImage? {
-        let content = HStack(spacing: 9) {
+    /// 메뉴 막대는 글자 사이의 아이콘을 지워버려서, 컬러 아이콘+숫자를 한 장의 그림으로 만들어 표시.
+    /// 글자색은 메뉴 막대가 어두우면 흰색, 밝으면 검은색.
+    func rendered(_ items: [MenuBarMetric], dark: Bool) -> NSImage? {
+        let content = HStack(spacing: 10) {
             ForEach(items) { it in
-                HStack(spacing: 3) {
+                HStack(spacing: 4) {
                     Image(systemName: it.icon)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(LinearGradient(colors: it.colors, startPoint: .top, endPoint: .bottom))
                     Text(it.value)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 12, weight: .semibold))
                         .monospacedDigit()
+                        .foregroundStyle(dark ? Color.white : Color.black.opacity(0.85))
                 }
             }
         }
-        .foregroundStyle(Color.black)
         .padding(.horizontal, 1)
         .frame(height: 18)
 
         let renderer = ImageRenderer(content: content)
         renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
         guard let img = renderer.nsImage else { return nil }
-        img.isTemplate = true
+        img.isTemplate = false   // 색을 그대로 유지
         return img
     }
 
@@ -2226,7 +2240,7 @@ struct MenuBarLabel: View {
         let items = metrics
         if items.isEmpty {
             Image(systemName: "sparkles")
-        } else if let img = rendered(items) {
+        } else if let img = rendered(items, dark: scheme == .dark) {
             Image(nsImage: img)
         } else {
             Text(items.map(\.value).joined(separator: "  "))
