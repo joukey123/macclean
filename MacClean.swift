@@ -2169,9 +2169,9 @@ enum LoginItem {
 /// 메뉴 막대용 짧은 용량 표기: 561GB, 48.2GB, 1.2TB (Finder와 같은 1000 단위)
 func compactBytes(_ b: Int64) -> String {
     let gb = Double(b) / 1_000_000_000
-    if gb >= 1000 { return String(format: "%.1fTB", gb / 1000) }
-    if gb >= 100 { return String(format: "%.0fGB", gb) }
-    if gb >= 1 { return String(format: "%.1fGB", gb) }
+    if gb >= 999.5 { return String(format: "%.1fTB", gb / 1000) }
+    if gb >= 99.95 { return String(format: "%.0fGB", gb) }
+    if gb >= 0.995 { return String(format: "%.1fGB", gb) }
     return String(format: "%.0fMB", Double(b) / 1_000_000)
 }
 
