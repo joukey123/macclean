@@ -263,8 +263,32 @@ enum Updater {
     static let repo = "joukey123/macclean"
     static let branch = "main"
 
+    /// GitHub API: 캐시가 거의 없어서 올리자마자 보임 (시간당 60회 제한이라 실패하면 raw 주소로)
+    static var apiVersionURL: URL {
+        URL(string: "https://api.github.com/repos/\(repo)/contents/version.json?ref=\(branch)")!
+    }
     static var versionURL: URL {
         URL(string: "https://raw.githubusercontent.com/\(repo)/\(branch)/version.json?t=\(Int(Date().timeIntervalSince1970))")!
+    }
+
+    static func fetchRemoteVersion() async throws -> RemoteVersion {
+        var api = URLRequest(url: apiVersionURL)
+        api.setValue("application/vnd.github.raw", forHTTPHeaderField: "Accept")
+        api.setValue("MacClean", forHTTPHeaderField: "User-Agent")
+        let raw = URLRequest(url: versionURL)
+        var lastError: Error = URLError(.badServerResponse)
+        for var req in [api, raw] {
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            req.timeoutInterval = 15
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                return try JSONDecoder().decode(RemoteVersion.self, from: data)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
     }
     static var sourceZipURL: URL {
         URL(string: "https://codeload.github.com/\(repo)/zip/refs/heads/\(branch)")!
@@ -568,6 +592,13 @@ final class Model: ObservableObject {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
+        // 메뉴 막대에 상주하는 동안 30분마다 새 버전 확인
+        Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                await self.checkForUpdate(silent: true)
+            }
+        }
     }
 
     // 내 맥
@@ -657,19 +688,20 @@ final class Model: ObservableObject {
 
     func checkForUpdate(silent: Bool = true) async {
         if [.downloading, .building, .restarting].contains(updateState) { return }
+        let previous = updateState
         updateState = .checking
         do {
-            var req = URLRequest(url: Updater.versionURL)
-            req.cachePolicy = .reloadIgnoringLocalCacheData
-            req.timeoutInterval = 15
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            let info = try JSONDecoder().decode(RemoteVersion.self, from: data)
+            let info = try await Updater.fetchRemoteVersion()
             latestVersion = info.version
             latestNotes = info.notes
             updateState = Updater.isNewer(info.version, than: currentVersion) ? .available : .upToDate
         } catch {
-            updateState = silent ? .idle : .failed("업데이트 정보를 가져오지 못했어요. 인터넷 연결을 확인해주세요.")
+            if silent {
+                // 자동 확인이 실패해도 이미 보이던 업데이트 버튼은 그대로 둠
+                updateState = (previous == .available) ? .available : .idle
+            } else {
+                updateState = .failed("업데이트 정보를 가져오지 못했어요. 인터넷 연결을 확인해주세요.")
+            }
         }
     }
 
