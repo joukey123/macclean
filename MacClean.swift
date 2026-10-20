@@ -4,6 +4,7 @@
 import SwiftUI
 import AppKit
 import IOKit.ps
+import ServiceManagement
 
 // MARK: - 데이터
 
@@ -549,6 +550,26 @@ enum SysProbe {
 
 @MainActor
 final class Model: ObservableObject {
+    @Published var pane: Pane = .scan
+
+    init() {
+        startMonitoring()
+    }
+
+    /// 메뉴 막대용: 창이 닫혀 있어도 3초마다 CPU·메모리·저장 공간 갱신
+    private var monitoring = false
+    func startMonitoring() {
+        guard !monitoring else { return }
+        monitoring = true
+        // Model은 앱이 켜져 있는 동안 계속 살아 있으므로 그대로 잡아둬도 됨
+        Task {
+            while !Task.isCancelled {
+                await self.refreshLive(includeApps: false)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
     // 내 맥
     @Published var hw: HardwareInfo?
     @Published var mem = MemInfo()
@@ -1167,38 +1188,49 @@ struct Card<Content: View>: View {
 @main
 struct MacCleanApp: App {
     @StateObject private var model = Model()
+    @AppStorage("menuBarEnabled") private var menuBarEnabled = true
 
     var body: some Scene {
-        WindowGroup {
+        // 창은 하나만 (메뉴 막대에서 '열기'를 눌러도 새 창이 늘어나지 않게)
+        Window("MacClean", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 960, minHeight: 640)
         }
         .windowStyle(.hiddenTitleBar)
+
+        // 오른쪽 위 메뉴 막대: CPU · 메모리 · 남은 저장 공간
+        MenuBarExtra(isInserted: $menuBarEnabled) {
+            MenuBarPanel()
+                .environmentObject(model)
+        } label: {
+            MenuBarLabel()
+                .environmentObject(model)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var m: Model
-    @State private var pane: Pane = .scan
 
     var body: some View {
         ZStack {
             ForEach(Pane.allCases, id: \.self) { p in
-                Backdrop(colors: p.gradient).opacity(pane == p ? 1 : 0)
+                Backdrop(colors: p.gradient).opacity(m.pane == p ? 1 : 0)
             }
             .ignoresSafeArea()
-            .animation(.easeInOut(duration: 0.45), value: pane)
+            .animation(.easeInOut(duration: 0.45), value: m.pane)
 
             HStack(spacing: 0) {
-                Sidebar(pane: $pane)
+                Sidebar(pane: $m.pane)
                 Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1).ignoresSafeArea()
                 VStack(spacing: 0) {
                     BannerView()
                     Group {
-                        switch pane {
+                        switch m.pane {
                         case .scan: ScanView()
-                        case .system: SystemView { pane = .scan }
+                        case .system: SystemView { m.pane = .scan }
                         case .privacy: PrivacyView()
                         case .apps: AppsView()
                         case .trash: TrashView()
@@ -1837,6 +1869,7 @@ struct SystemView: View {
     @EnvironmentObject var m: Model
     let goScan: () -> Void
     @State private var confirmPurge = false
+    @AppStorage("menuBarEnabled") private var menuBarEnabled = true
 
     var uptime: String {
         guard let boot = m.hw?.bootDate else { return "" }
@@ -1900,6 +1933,15 @@ struct SystemView: View {
                     .foregroundStyle(Color.white.opacity(0.55))
             }
             Spacer()
+            VStack(alignment: .trailing, spacing: 4) {
+                Toggle("메뉴 막대에 표시", isOn: $menuBarEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 12, weight: .medium))
+                Text("오른쪽 위에 CPU·메모리·저장 공간")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.white.opacity(0.5))
+            }
         }
     }
 
@@ -2110,6 +2152,210 @@ struct HeavyAppRow: View {
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(Color.white.opacity(hover ? 0.1 : 0.05)))
         .onHover { hover = $0 }
+    }
+}
+
+// MARK: - 메뉴 막대
+
+enum LoginItem {
+    static var isOn: Bool { SMAppService.mainApp.status == .enabled }
+    static var needsApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
+
+    static func set(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+    }
+}
+
+func compactBytes(_ b: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: b, countStyle: .file).replacingOccurrences(of: " ", with: "")
+}
+
+struct MenuBarLabel: View {
+    @EnvironmentObject var m: Model
+    @AppStorage("mbShowCPU") private var showCPU = true
+    @AppStorage("mbShowRAM") private var showRAM = true
+    @AppStorage("mbShowDisk") private var showDisk = true
+
+    var label: Text {
+        var t = Text("")
+        var first = true
+        func add(_ icon: String, _ value: String) {
+            if !first { t = t + Text("  ") }
+            t = t + Text(Image(systemName: icon)) + Text(" " + value)
+            first = false
+        }
+        if showCPU { add("cpu", "\(Int((m.cpu * 100).rounded()))%") }
+        if showRAM, m.mem.total > 0 { add("memorychip", "\(Int(Double(m.mem.used) / Double(m.mem.total) * 100))%") }
+        if showDisk, m.disk.total > 0 { add("internaldrive", compactBytes(m.disk.free)) }
+        return t
+    }
+
+    var body: some View {
+        if !showCPU && !showRAM && !showDisk {
+            Image(systemName: "sparkles")
+        } else {
+            label.monospacedDigit()
+        }
+    }
+}
+
+struct MeterRow: View {
+    let icon: String
+    let title: String
+    let detail: String
+    let value: Double
+    let colors: [Color]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(colors.last ?? Color.white)
+                    .frame(width: 16)
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(detail).font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
+                    .foregroundStyle(Color.white.opacity(0.8))
+            }
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.1))
+                    Capsule()
+                        .fill(LinearGradient(colors: colors, startPoint: .leading, endPoint: .trailing))
+                        .frame(width: max(4, g.size.width * CGFloat(min(max(value, 0), 1))))
+                }
+            }
+            .frame(height: 6)
+            .animation(.easeInOut(duration: 0.5), value: value)
+        }
+    }
+}
+
+struct MenuBarPanel: View {
+    @EnvironmentObject var m: Model
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage("menuBarEnabled") private var menuBarEnabled = true
+    @AppStorage("mbShowCPU") private var showCPU = true
+    @AppStorage("mbShowRAM") private var showRAM = true
+    @AppStorage("mbShowDisk") private var showDisk = true
+    @State private var showSettings = false
+    @State private var loginOn = LoginItem.isOn
+    @State private var loginNeedsApproval = LoginItem.needsApproval
+
+    var loginBinding: Binding<Bool> {
+        Binding(
+            get: { loginOn },
+            set: { on in
+                do { try LoginItem.set(on) } catch {
+                    m.error = "로그인 시 자동 실행을 바꾸지 못했어요: \(error.localizedDescription)"
+                }
+                loginOn = LoginItem.isOn
+                loginNeedsApproval = LoginItem.needsApproval
+            }
+        )
+    }
+
+    func show(_ pane: Pane) {
+        m.pane = pane
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    var pressure: (String, Color) {
+        switch m.mem.pressure {
+        case 4: return ("메모리 부족", Color(hex: 0xF87171))
+        case 2: return ("조금 빠듯해요", Color(hex: 0xFCD34D))
+        default: return ("여유 있어요", Color(hex: 0x6EE7B7))
+        }
+    }
+
+    var body: some View {
+        let memFrac = m.mem.total > 0 ? Double(m.mem.used) / Double(m.mem.total) : 0
+        let diskUsed = max(0, m.disk.total - m.disk.free)
+        let diskFrac = m.disk.total > 0 ? Double(diskUsed) / Double(m.disk.total) : 0
+
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                IconTile(icon: "sparkles", colors: [Color(hex: 0xFF8CC6), Color(hex: 0x8E6BFF)], size: 26)
+                Text("MacClean").font(.system(size: 15, weight: .bold, design: .rounded))
+                Spacer()
+                Text(pressure.0)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(pressure.1)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(pressure.1.opacity(0.18), in: Capsule())
+            }
+
+            MeterRow(icon: "cpu.fill", title: "CPU",
+                     detail: "\(Int((m.cpu * 100).rounded()))%",
+                     value: m.cpu, colors: [Color(hex: 0x86EFAC), Color(hex: 0x14B8A6)])
+            MeterRow(icon: "memorychip.fill", title: "메모리",
+                     detail: "\(fmtMem(m.mem.used)) / \(fmtMem(m.mem.total))",
+                     value: memFrac, colors: [Color(hex: 0xF0ABFC), Color(hex: 0x8B5CF6)])
+            MeterRow(icon: "internaldrive.fill", title: "저장 공간",
+                     detail: "\(fmt(m.disk.free)) 남음",
+                     value: diskFrac,
+                     colors: diskFrac > 0.9 ? [Color(hex: 0xFCA5A5), Color(hex: 0xDC2626)] : [Color(hex: 0x7DD3FC), Color(hex: 0x6366F1)])
+            if let b = m.battery {
+                MeterRow(icon: b.charging ? "battery.100.bolt" : "battery.75", title: "배터리",
+                         detail: "\(b.percent)%" + (b.charging ? " · 충전 중" : ""),
+                         value: Double(b.percent) / 100,
+                         colors: b.percent <= 20 ? [Color(hex: 0xFCA5A5), Color(hex: 0xDC2626)] : [Color(hex: 0xFDE047), Color(hex: 0x84CC16)])
+            }
+
+            Rectangle().fill(Color.white.opacity(0.1)).frame(height: 1)
+
+            HStack(spacing: 8) {
+                Button { show(.scan) } label: {
+                    Label("스마트 스캔", systemImage: "sparkles").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PillButton())
+                Button { show(.system) } label: {
+                    Label("자세히", systemImage: "laptopcomputer")
+                }
+                .buttonStyle(GhostButton())
+            }
+
+            DisclosureGroup(isExpanded: $showSettings) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Toggle("메뉴 막대에 CPU 표시", isOn: $showCPU)
+                    Toggle("메뉴 막대에 메모리 표시", isOn: $showRAM)
+                    Toggle("메뉴 막대에 남은 저장 공간 표시", isOn: $showDisk)
+                    Toggle("로그인할 때 자동 실행", isOn: loginBinding)
+                    if loginNeedsApproval {
+                        Text("시스템 설정 → 일반 → 로그인 항목에서 MacClean을 허용해주세요.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Color(hex: 0xFCD34D))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .font(.system(size: 12))
+                .padding(.top, 6)
+            } label: {
+                Text("설정").font(.system(size: 12, weight: .semibold))
+            }
+
+            HStack {
+                Button("메뉴 막대에서 숨기기") { menuBarEnabled = false }
+                Spacer()
+                Button("MacClean 종료") { NSApp.terminate(nil) }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11))
+            .foregroundStyle(Color.white.opacity(0.55))
+        }
+        .padding(16)
+        .frame(width: 310)
+        .background(LinearGradient(colors: Pane.system.gradient, startPoint: .topLeading, endPoint: .bottomTrailing))
+        .foregroundStyle(Color.white)
+        .preferredColorScheme(.dark)
+        .onAppear {
+            loginOn = LoginItem.isOn
+            loginNeedsApproval = LoginItem.needsApproval
+        }
     }
 }
 
