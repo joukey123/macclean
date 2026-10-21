@@ -324,6 +324,29 @@ enum Updater {
         URL(string: "https://codeload.github.com/\(repo)/zip/refs/heads/\(branch)")!
     }
 
+    /// Release 파일: 받을 때마다 GitHub이 다운로드 횟수를 세줌
+    static func releaseZipURL(_ version: String) -> URL {
+        URL(string: "https://github.com/\(repo)/releases/download/v\(version)/MacClean.zip")!
+    }
+
+    /// Release 파일을 먼저 받고, 그 버전의 Release가 없으면 기존 방식(저장소 최신 코드)으로
+    static func downloadSource(version: String?) async throws -> URL {
+        var sources: [URL] = []
+        if let v = version { sources.append(releaseZipURL(v)) }
+        sources.append(sourceZipURL)
+        var lastError: Error = URLError(.badServerResponse)
+        for url in sources {
+            do {
+                let (tmp, resp) = try await URLSession.shared.download(from: url)
+                guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                return tmp
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
     static func isNewer(_ a: String, than b: String) -> Bool {
         let pa = a.split(separator: ".").map { Int($0) ?? 0 }
         let pb = b.split(separator: ".").map { Int($0) ?? 0 }
@@ -747,8 +770,7 @@ final class Model: ObservableObject {
             try fm.createDirectory(at: work, withIntermediateDirectories: true)
 
             updateState = .downloading
-            let (tmp, resp) = try await URLSession.shared.download(from: Updater.sourceZipURL)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            let tmp = try await Updater.downloadSource(version: latestVersion)
             let zip = work.appendingPathComponent("source.zip")
             try fm.moveItem(at: tmp, to: zip)
             let src = work.appendingPathComponent("source")
