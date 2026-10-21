@@ -1,0 +1,55 @@
+# version.json의 버전이 바뀌면 GitHub이 자동으로 Release(v버전)를 만들고 MacClean.zip을 올려요.
+# Release 파일은 다운로드될 때마다 GitHub이 횟수를 세줘요.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [version.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 버전 읽기
+        id: ver
+        run: |
+          echo "version=$(jq -r .version version.json)" >> "$GITHUB_OUTPUT"
+          jq -r '.notes // ""' version.json > notes.txt
+
+      - name: 이미 있는 버전인지 확인
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: MacClean.zip 만들기
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          mkdir -p dist/MacClean
+          git archive HEAD | tar -x -C dist/MacClean
+          rm -rf dist/MacClean/.github
+          (cd dist && zip -qr MacClean.zip MacClean)
+          unzip -l dist/MacClean.zip
+
+      - name: Release 만들기
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.version }}" dist/MacClean.zip \
+            --title "MacClean ${{ steps.ver.outputs.version }}" \
+            --notes-file notes.txt \
+            --target "${{ github.sha }}" \
+            --latest
